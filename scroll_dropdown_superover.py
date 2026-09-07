@@ -70,6 +70,10 @@ match_metadata = {
 
 SUPER_OVER_RE = re.compile(r'super|\bso\b|\bs[\s\-]?over\b|super[\s\-]?5', re.IGNORECASE)
 DROPDOWN_SELECTOR = "button:has(i.icon-caret_down), button:has(span.ds-text-button-3)"
+# span.ds-text-button-3 is ESPN's generic button typography class - it sits on the innings
+# picker AND on half the other buttons on the page, so the selector also has to check that
+# the button's own text looks like an innings label ("1st Innings", "Super Over 1", ...).
+INNINGS_LABEL_RE = re.compile(r'innings|super[\s\-]?over|\bs[\s\-]?over\b|super[\s\-]?5|\bso\b', re.IGNORECASE)
 OPTIONS_SELECTOR = ("div[data-floating-ui-portal] div.ds-cursor-pointer, div.ds-popper div.ds-cursor-pointer, "
                     "[role='option'], li")
 
@@ -300,17 +304,41 @@ def remove_ad_and_cookie_overlays(page):
         });
     }""")
 
+def option_text(el):
+    """First line of an element's text, or '' if it vanished mid-flight."""
+    try:
+        return (el.inner_text() or "").strip().split('\n')[0].strip()
+    except Exception:
+        return ""
+
+def find_dropdown_button(page):
+    """
+    The innings selector. Preference goes to the candidate whose label looks like an
+    innings ("Super Over 1", "2nd Innings"); a plain button carrying the generic
+    ds-text-button-3 class is only used when nothing else matches.
+    """
+    try:
+        candidates = page.locator(DROPDOWN_SELECTOR).all()
+    except Exception:
+        return None
+    fallback = None
+    for cand in candidates:
+        txt = option_text(cand)
+        if not txt:
+            continue
+        if INNINGS_LABEL_RE.search(txt):
+            return cand
+        if fallback is None:
+            fallback = cand
+    return fallback
+
 def get_current_button_text(page):
     remove_ad_and_cookie_overlays(page)
-    try:
-        dropdown_btn = page.locator(DROPDOWN_SELECTOR).first
-    except Exception:
-        return "Default Innings"
-    if dropdown_btn.count() > 0:
-        try:
-            return dropdown_btn.inner_text().strip().split('\n')[0].strip()
-        except Exception:
-            pass
+    dropdown_btn = find_dropdown_button(page)
+    if dropdown_btn is not None:
+        txt = option_text(dropdown_btn)
+        if txt:
+            return txt
     return "Default Innings"
 
 def open_dropdown(page):
@@ -319,8 +347,8 @@ def open_dropdown(page):
     safe_evaluate(page, "window.scrollTo(0, 0)")
     page.wait_for_timeout(500)
 
-    dropdown_btn = page.locator(DROPDOWN_SELECTOR).first
-    if dropdown_btn.count() == 0:
+    dropdown_btn = find_dropdown_button(page)
+    if dropdown_btn is None:
         print("  -> No dropdown button available.")
         return None
 
@@ -331,24 +359,34 @@ def open_dropdown(page):
             return None
 
     page.wait_for_timeout(1000)
-    return page.locator(OPTIONS_SELECTOR).all()
+    return collect_innings_options(page)
+
+def collect_innings_options(page):
+    """
+    [(element, label)] for the popup, DOM order preserved. Only real innings views are kept
+    - duplicate labels are NOT merged, a tie lists one super over per side under the same
+    text ("Super Over 1" twice), and de-duping them is what skipped the second side.
+    """
+    try:
+        raw = page.locator(OPTIONS_SELECTOR).all()
+    except Exception:
+        return []
+    labelled, everything = [], []
+    for el in raw:
+        name = option_text(el)
+        if not name or "feedback" in name.lower():
+            continue
+        everything.append((el, name))
+        if INNINGS_LABEL_RE.search(name):
+            labelled.append((el, name))
+    return labelled or everything
 
 def list_innings_options(page):
     """[(position, label)] for every view in the dropdown, including super overs."""
     options = open_dropdown(page)
     if not options:
         return []
-
-    entries = []
-    for position, opt in enumerate(options):
-        try:
-            txt = opt.inner_text().strip()
-        except Exception:
-            continue
-        name = txt.split('\n')[0].strip()
-        if not name or "feedback" in name.lower():
-            continue
-        entries.append((position, name))
+    entries = [(position, name) for position, (_, name) in enumerate(options)]
 
     try:
         page.mouse.click(10, 10)   # close the popup again
@@ -363,16 +401,13 @@ def switch_to_innings_option(page, position, expected_label):
     if not options or position >= len(options):
         return False
 
-    try:
-        actual = options[position].inner_text().strip().split('\n')[0].strip()
-    except Exception:
-        actual = ""
+    actual = option_text(options[position][0]) if position < len(options) else ""
     if actual and expected_label and actual != expected_label:
         print(f"  -> note: option {position} reads '{actual}' (expected '{expected_label}')")
 
     print(f"\n[+] Switching to innings view {position + 1}: '{expected_label}'...")
     try:
-        options[position].click(force=True)
+        options[position][0].click(force=True)
         page.wait_for_timeout(3500)
         return True
     except Exception as e:
