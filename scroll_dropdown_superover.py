@@ -10,6 +10,19 @@ import re
 match_urls = ["https://www.cricinfo.com/series/icc-men-s-t20-world-cup-2024-1411166/united-states-of-america-vs-pakistan-11th-match-group-a-1415711/ball-by-ball-commentary",
 ]
 
+def normalise_url(url):
+    """
+    www.cricinfo.com is only a redirect target: loading it leaves the page navigating
+    while the next Playwright call runs, which is what raises
+    "Execution context was destroyed, most likely because of a navigation".
+    Go straight to the canonical host (and https).
+    """
+    url = url.strip()
+    url = re.sub(r'^http://', 'https://', url)
+    url = re.sub(r'^(https?://)?(www\.)?cricinfo\.com', r'https://www.espncricinfo.com', url)
+    url = url.replace("https://www.espncricinfo.com/info", "https://www.espncricinfo.com")
+    return url
+
 def extract_match_id(url):
     patterns = [
         r'/(\d+)(?=[-/](?:ball|live|full|score|commentary))',
@@ -59,6 +72,47 @@ SUPER_OVER_RE = re.compile(r'super|\bso\b|\bs[\s\-]?over\b|super[\s\-]?5', re.IG
 DROPDOWN_SELECTOR = "button:has(i.icon-caret_down), button:has(span.ds-text-button-3)"
 OPTIONS_SELECTOR = ("div[data-floating-ui-portal] div.ds-cursor-pointer, div.ds-popper div.ds-cursor-pointer, "
                     "[role='option'], li")
+
+def normalise_url(url):
+    url = str(url).strip()
+    url = re.sub(r'^http://', 'https://', url)
+    url = re.sub(r'^(https?://)?(www\.)?cricinfo\.com', r'https://www.espncricinfo.com', url)
+    return url
+
+match_url = normalise_url(match_url)
+scorecard_url_base = match_url
+
+def safe_evaluate(page, script, arg=None, retries=3, optional=True):
+    """
+    page.evaluate() raises "Execution context was destroyed, most likely because of a
+    navigation" whenever the site is still redirecting/loading (cricinfo.com ->
+    espncricinfo.com, cookie walls, A/B redirects). Waiting for the load state and
+    retrying is enough in practice; metadata scrapes are cosmetic, so they must never
+    abort the run (optional=True).
+    """
+    last = None
+    for attempt in range(1, retries + 1):
+        try:
+            try:
+                page.wait_for_load_state("domcontentloaded", timeout=15000)
+            except Exception:
+                pass
+            return page.evaluate(script, arg) if arg is not None else page.evaluate(script)
+        except Exception as exc:
+            last = exc
+            text = str(exc)
+            recoverable = ("Execution context was destroyed" in text or "navigation" in text.lower()
+                           or "Target closed" in text or "has been closed" in text or "detached" in text.lower())
+            if not recoverable:
+                break
+            print(f"  -> page is still navigating (attempt {attempt}/{retries}); waiting and retrying...")
+            try:
+                page.wait_for_timeout(1500 * attempt)
+            except Exception:
+                break
+    if optional:
+        return None
+    raise last
 
 def is_super_over_label(label):
     """A dropdown view whose label mentions a tie-breaker ('Super Over', '1st Super Over', 'Super 5')."""
@@ -232,7 +286,7 @@ def extract_direct_match_header_json(root_json):
                     match_metadata["venue"] = str(g_name).strip()
 
 def remove_ad_and_cookie_overlays(page):
-    page.evaluate("""() => {
+    safe_evaluate(page, """() => {
         const otBtn = document.getElementById('onetrust-accept-btn-handler');
         if (otBtn) otBtn.click();
         const selectors = [
@@ -248,7 +302,10 @@ def remove_ad_and_cookie_overlays(page):
 
 def get_current_button_text(page):
     remove_ad_and_cookie_overlays(page)
-    dropdown_btn = page.locator(DROPDOWN_SELECTOR).first
+    try:
+        dropdown_btn = page.locator(DROPDOWN_SELECTOR).first
+    except Exception:
+        return "Default Innings"
     if dropdown_btn.count() > 0:
         try:
             return dropdown_btn.inner_text().strip().split('\n')[0].strip()
@@ -259,7 +316,7 @@ def get_current_button_text(page):
 def open_dropdown(page):
     """Open the innings selector and return the list of option handles (DOM order)."""
     remove_ad_and_cookie_overlays(page)
-    page.evaluate("window.scrollTo(0, 0)")
+    safe_evaluate(page, "window.scrollTo(0, 0)")
     page.wait_for_timeout(500)
 
     dropdown_btn = page.locator(DROPDOWN_SELECTOR).first
@@ -270,9 +327,7 @@ def open_dropdown(page):
     try:
         dropdown_btn.click(force=True, timeout=4000)
     except Exception:
-        try:
-            page.evaluate("() => { const b = document.querySelector('button:has(i.icon-caret_down)'); if(b) b.click(); }")
-        except Exception:
+        if safe_evaluate(page, "() => { const b = document.querySelector('button:has(i.icon-caret_down)'); if(b) b.click(); }") is None:
             return None
 
     page.wait_for_timeout(1000)
@@ -341,7 +396,7 @@ def scroll_active_feed(page, label, view_start, max_scrolls=140):
     for s_idx in range(1, max_scrolls + 1):
         remove_ad_and_cookie_overlays(page)
 
-        page.evaluate("""() => {
+        safe_evaluate(page, """() => {
             window.scrollTo(0, document.body.scrollHeight);
             setTimeout(() => window.scrollBy(0, -400), 100);
             setTimeout(() => window.scrollTo(0, document.body.scrollHeight), 250);
@@ -385,179 +440,199 @@ def tag_view(view_start, view_end, label):
     print(f"  🏷 tagged {tagged} deliveries to view '{label}' {'(SUPER OVER)' if flag else ''}")
 
 print("[+] Launching Chromium browser...")
-with sync_playwright() as p:
-    browser = p.chromium.launch(
-        headless=False,
-        args=["--start-minimized", "--disable-blink-features=AutomationControlled"]
-    )
-    context = browser.new_context(
-        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        viewport={"width": 1366, "height": 900}
-    )
-    page = context.new_page()
+try:
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=False,
+            args=["--start-minimized", "--disable-blink-features=AutomationControlled"]
+        )
+        context = browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            viewport={"width": 1366, "height": 900}
+        )
+        page = context.new_page()
 
-    page.route("**/*", lambda route: route.abort() if any(d in route.request.url.lower() for d in [
-        "googlesyndication", "doubleclick", "amazon-adsystem", "outbrain", "criteo", "clevertap", "wzrk"
-    ]) else route.continue_())
+        page.route("**/*", lambda route: route.abort() if any(d in route.request.url.lower() for d in [
+            "googlesyndication", "doubleclick", "amazon-adsystem", "outbrain", "criteo", "clevertap", "wzrk"
+        ]) else route.continue_())
 
-    def on_response(response):
-        if "comments" in response.url or "scorecard" in response.url or "match" in response.url:
-            try:
-                res_json = response.json()
-                balls = parse_comments(res_json)
-                if balls:
-                    all_captured_balls.extend(balls)
-                find_players_anywhere(res_json)
-                extract_direct_match_header_json(res_json)
-            except Exception:
-                pass
+        def on_response(response):
+            if "comments" in response.url or "scorecard" in response.url or "match" in response.url:
+                try:
+                    res_json = response.json()
+                    balls = parse_comments(res_json)
+                    if balls:
+                        all_captured_balls.extend(balls)
+                    find_players_anywhere(res_json)
+                    extract_direct_match_header_json(res_json)
+                except Exception:
+                    pass
 
-    page.on("response", on_response)
+        page.on("response", on_response)
 
-    # 1. Load Commentary Page
-    print(f"[+] Loading match commentary: {match_url}")
-    page.goto(match_url, wait_until="domcontentloaded", timeout=60000)
-    page.wait_for_timeout(3500)
-    remove_ad_and_cookie_overlays(page)
+        # 1. Load Commentary Page
+        print(f"[+] Loading match commentary: {match_url}")
+        page.goto(match_url, wait_until="domcontentloaded", timeout=60000)
+        try:
+            # espncricinfo keeps redirecting/hydrating after domcontentloaded; let the final
+            # URL settle so the JS context is not destroyed under the next evaluate()
+            page.wait_for_load_state("load", timeout=20000)
+        except Exception:
+            pass
+        if "espncricinfo.com" not in page.url:
+            print(f"  -> note: page.url is {page.url}")
+        page.wait_for_timeout(3500)
+        remove_ad_and_cookie_overlays(page)
 
-    try:
-        next_json_str = page.evaluate('() => document.getElementById("__NEXT_DATA__") ? document.getElementById("__NEXT_DATA__").textContent : null')
-        if next_json_str:
-            next_json = json.loads(next_json_str)
-            all_captured_balls.extend(parse_comments(next_json))
-            find_players_anywhere(next_json)
-            extract_direct_match_header_json(next_json)
-    except Exception:
-        pass
+        try:
+            next_json_str = safe_evaluate(page, '() => document.getElementById("__NEXT_DATA__") ? document.getElementById("__NEXT_DATA__").textContent : null')
+            if next_json_str:
+                next_json = json.loads(next_json_str)
+                all_captured_balls.extend(parse_comments(next_json))
+                find_players_anywhere(next_json)
+                extract_direct_match_header_json(next_json)
+        except Exception:
+            pass
 
-    dom_meta = page.evaluate(r"""() => {
-        let tournament = "";
-        let matchName = "";
-        let venue = "";
-
-        const sLink = document.querySelector('a[href^="/series/"][class*="ds-text-typo"], a[href^="/series/"] span, nav a[href*="/series/"]');
-        if (sLink) tournament = sLink.innerText.trim();
-
-        const h1 = document.querySelector('h1.ds-text-title-xs, h1');
-        if (h1) matchName = h1.innerText.trim();
-
-        const gLink = document.querySelector('a[href*="/cricket-grounds/"], a[href*="/ground/"]');
-        if (gLink) venue = gLink.innerText.trim();
-
-        return { tournament, matchName, venue };
-    }""")
-
-    if not match_metadata["tournamentName"] and dom_meta.get("tournament"):
-        match_metadata["tournamentName"] = dom_meta["tournament"]
-    if not match_metadata["matchName"] and dom_meta.get("matchName"):
-        match_metadata["matchName"] = dom_meta["matchName"]
-    if not match_metadata["venue"] and dom_meta.get("venue"):
-        match_metadata["venue"] = dom_meta["venue"]
-
-    # 2. Extract Squad Profiles & Exact Match Info from Scorecard page
-    scorecard_url = match_url.replace("ball-by-ball-commentary", "full-scorecard")
-    print(f"[+] Fetching scorecard squad & venue metadata from: {scorecard_url}")
-    expected_super_overs = []
-    try:
-        sc_page = context.new_page()
-        sc_page.goto(scorecard_url, wait_until="domcontentloaded", timeout=30000)
-        sc_page.wait_for_timeout(2000)
-
-        sc_json_str = sc_page.evaluate('() => document.getElementById("__NEXT_DATA__") ? document.getElementById("__NEXT_DATA__").textContent : null')
-        if sc_json_str:
-            sc_json = json.loads(sc_json_str)
-            find_players_anywhere(sc_json)
-            extract_direct_match_header_json(sc_json)
-            expected_super_overs = sorted(set(find_super_over_innings(sc_json)))
-
-        sc_dom_meta = sc_page.evaluate(r"""() => {
-            let venue = "";
+        dom_meta = safe_evaluate(page, r"""() => {
             let tournament = "";
+            let matchName = "";
+            let venue = "";
 
-            const rows = document.querySelectorAll('tr, div.ds-grid');
-            for (const row of rows) {
-                const text = row.innerText || "";
-                if ((text.includes("Venue") || text.includes("Stadium")) && !venue) {
-                    const gEl = row.querySelector('a[href*="/ground/"], a[href*="/cricket-grounds/"]') || row.lastElementChild;
-                    if (gEl) venue = gEl.innerText.trim();
+            const sLink = document.querySelector('a[href^="/series/"][class*="ds-text-typo"], a[href^="/series/"] span, nav a[href*="/series/"]');
+            if (sLink) tournament = sLink.innerText.trim();
+
+            const h1 = document.querySelector('h1.ds-text-title-xs, h1');
+            if (h1) matchName = h1.innerText.trim();
+
+            const gLink = document.querySelector('a[href*="/cricket-grounds/"], a[href*="/ground/"]');
+            if (gLink) venue = gLink.innerText.trim();
+
+            return { tournament, matchName, venue };
+        }""") or {}
+
+        if not match_metadata["tournamentName"] and dom_meta.get("tournament"):
+            match_metadata["tournamentName"] = dom_meta["tournament"]
+        if not match_metadata["matchName"] and dom_meta.get("matchName"):
+            match_metadata["matchName"] = dom_meta["matchName"]
+        if not match_metadata["venue"] and dom_meta.get("venue"):
+            match_metadata["venue"] = dom_meta["venue"]
+
+        # 2. Extract Squad Profiles & Exact Match Info from Scorecard page
+        scorecard_url = match_url.replace("ball-by-ball-commentary", "full-scorecard")
+        print(f"[+] Fetching scorecard squad & venue metadata from: {scorecard_url}")
+        expected_super_overs = []
+        try:
+            sc_page = context.new_page()
+            sc_page.goto(scorecard_url, wait_until="domcontentloaded", timeout=30000)
+            sc_page.wait_for_timeout(2000)
+
+            sc_json_str = safe_evaluate(sc_page, '() => document.getElementById("__NEXT_DATA__") ? document.getElementById("__NEXT_DATA__").textContent : null')
+            if sc_json_str:
+                sc_json = json.loads(sc_json_str)
+                find_players_anywhere(sc_json)
+                extract_direct_match_header_json(sc_json)
+                expected_super_overs = sorted(set(find_super_over_innings(sc_json)))
+
+            sc_dom_meta = safe_evaluate(sc_page, r"""() => {
+                let venue = "";
+                let tournament = "";
+
+                const rows = document.querySelectorAll('tr, div.ds-grid');
+                for (const row of rows) {
+                    const text = row.innerText || "";
+                    if ((text.includes("Venue") || text.includes("Stadium")) && !venue) {
+                        const gEl = row.querySelector('a[href*="/ground/"], a[href*="/cricket-grounds/"]') || row.lastElementChild;
+                        if (gEl) venue = gEl.innerText.trim();
+                    }
+                    if (text.includes("Series") && !tournament) {
+                        const sEl = row.querySelector('a[href*="/series/"]') || row.lastElementChild;
+                        if (sEl) tournament = sEl.innerText.trim();
+                    }
                 }
-                if (text.includes("Series") && !tournament) {
-                    const sEl = row.querySelector('a[href*="/series/"]') || row.lastElementChild;
-                    if (sEl) tournament = sEl.innerText.trim();
+                if (!venue) {
+                    const gLink = document.querySelector('a[href*="/cricket-grounds/"], a[href*="/ground/"]');
+                    if (gLink) venue = gLink.innerText.trim();
                 }
-            }
-            if (!venue) {
-                const gLink = document.querySelector('a[href*="/cricket-grounds/"], a[href*="/ground/"]');
-                if (gLink) venue = gLink.innerText.trim();
-            }
-            return { venue, tournament };
-        }""")
+                return { venue, tournament };
+            }""") or {}
 
-        if sc_dom_meta.get("venue"):
-            match_metadata["venue"] = sc_dom_meta["venue"]
-        if sc_dom_meta.get("tournament") and not match_metadata["tournamentName"]:
-            match_metadata["tournamentName"] = sc_dom_meta["tournament"]
+            if sc_dom_meta.get("venue"):
+                match_metadata["venue"] = sc_dom_meta["venue"]
+            if sc_dom_meta.get("tournament") and not match_metadata["tournamentName"]:
+                match_metadata["tournamentName"] = sc_dom_meta["tournament"]
 
-        sc_page.close()
-    except Exception as e:
-        print(f"[-] Supplementary scorecard query note: {e}")
+            sc_page.close()
+        except Exception as e:
+            print(f"[-] Supplementary scorecard query note: {e}")
 
-    if not match_metadata["tournamentName"]:
-        t_match = re.search(r'/series/([^/]+?)(?:-\d+)?/', match_url)
-        if t_match:
-            slug = re.sub(r'-\d+$', '', t_match.group(1))
-            match_metadata["tournamentName"] = slug.replace('-', ' ').title()
+        if not match_metadata["tournamentName"]:
+            t_match = re.search(r'/series/([^/]+?)(?:-\d+)?/', match_url)
+            if t_match:
+                slug = re.sub(r'-\d+$', '', t_match.group(1))
+                match_metadata["tournamentName"] = slug.replace('-', ' ').title()
 
-    if not match_metadata["matchName"]:
-        m_match = re.search(r'/([^/]+?-\d+(?:st|nd|rd|th)?-match-\d+|[^/]+?-vs-[^/]+?-\d+)/', match_url)
-        if m_match:
-            slug = re.sub(r'-\d+$', '', m_match.group(1))
-            match_metadata["matchName"] = slug.replace('-', ' ').title()
+        if not match_metadata["matchName"]:
+            m_match = re.search(r'/([^/]+?-\d+(?:st|nd|rd|th)?-match-\d+|[^/]+?-vs-[^/]+?-\d+)/', match_url)
+            if m_match:
+                slug = re.sub(r'-\d+$', '', m_match.group(1))
+                match_metadata["matchName"] = slug.replace('-', ' ').title()
 
-    if not match_metadata["venue"]:
-        match_metadata["venue"] = "Unknown Venue"
+        if not match_metadata["venue"]:
+            match_metadata["venue"] = "Unknown Venue"
 
-    print("=" * 60)
-    print(f"[+] Tournament : {match_metadata['tournamentName']}")
-    print(f"[+] Match      : {match_metadata['matchName']}")
-    print(f"[+] Venue      : {match_metadata['venue']}")
-    print(f"[+] Registered metadata for {len(player_map)} squad players.")
-    if expected_super_overs:
-        print(f"[+] Scorecard reports {len(expected_super_overs)} super-over innings: {expected_super_overs}")
-    print("=" * 60)
-
-    # 3. Walk EVERY view in the innings dropdown. Positions, not labels: a tied match
-    #    lists "Super Over" / "1st Super Over" entries, sometimes twice with the same
-    #    label (once per side), which label-matching silently skips.
-    dropdown_views = list_innings_options(page)
-    current_label = get_current_button_text(page)
-    if dropdown_views and dropdown_views[0][0] == 0:
-        # position 0 is whatever is already on screen; prefer the live button label
-        label0 = current_label if current_label not in ("", "Default Innings") else dropdown_views[0][1]
-        all_innings_views = [(0, label0)] + dropdown_views[1:]
-    else:
-        all_innings_views = [(0, current_label)] + list(dropdown_views)
-
-    print(f"[+] Innings views found: {[lab for _, lab in all_innings_views]}")
-    if expected_super_overs and not any(is_super_over_label(lab) for _, lab in all_innings_views):
-        print("⚠️  Scorecard has a super over but NO dropdown view was labelled as one -")
-        print("   the tie-breaker may be missing from this CSV. Check the innings selector manually.")
-
-    for step, (position, label) in enumerate(all_innings_views, start=1):
-        view_start = len(all_captured_balls)
         print("=" * 60)
-        if step == 1:
-            print(f"[+] STEP {step}: Processing default loaded view: '{label}'")
+        print(f"[+] Tournament : {match_metadata['tournamentName']}")
+        print(f"[+] Match      : {match_metadata['matchName']}")
+        print(f"[+] Venue      : {match_metadata['venue']}")
+        print(f"[+] Registered metadata for {len(player_map)} squad players.")
+        if expected_super_overs:
+            print(f"[+] Scorecard reports {len(expected_super_overs)} super-over innings: {expected_super_overs}")
+        print("=" * 60)
+
+        # 3. Walk EVERY view in the innings dropdown. Positions, not labels: a tied match
+        #    lists "Super Over" / "1st Super Over" entries, sometimes twice with the same
+        #    label (once per side), which label-matching silently skips.
+        dropdown_views = list_innings_options(page)
+        current_label = get_current_button_text(page)
+        if dropdown_views and dropdown_views[0][0] == 0:
+            # position 0 is whatever is already on screen; prefer the live button label
+            label0 = current_label if current_label not in ("", "Default Innings") else dropdown_views[0][1]
+            all_innings_views = [(0, label0)] + dropdown_views[1:]
         else:
-            if not switch_to_innings_option(page, position, label):
-                print(f"[-] Skipping view {position} ('{label}') - could not select it")
-                continue
-            print(f"[+] STEP {step}: Processing switched view: '{label}'")
-        print("=" * 60)
-        scroll_active_feed(page, label=label, view_start=view_start)
-        tag_view(view_start, len(all_captured_balls), label)
+            all_innings_views = [(0, current_label)] + list(dropdown_views)
 
-    browser.close()
+        print(f"[+] Innings views found: {[lab for _, lab in all_innings_views]}")
+        if expected_super_overs and not any(is_super_over_label(lab) for _, lab in all_innings_views):
+            print("⚠️  Scorecard has a super over but NO dropdown view was labelled as one -")
+            print("   the tie-breaker may be missing from this CSV. Check the innings selector manually.")
+
+        for step, (position, label) in enumerate(all_innings_views, start=1):
+            view_start = len(all_captured_balls)
+            print("=" * 60)
+            try:
+                if step == 1:
+                    print(f"[+] STEP {step}: Processing default loaded view: '{label}'")
+                else:
+                    if not switch_to_innings_option(page, position, label):
+                        print(f"[-] Skipping view {position} ('{label}') - could not select it")
+                        continue
+                    print(f"[+] STEP {step}: Processing switched view: '{label}'")
+                print("=" * 60)
+                scroll_active_feed(page, label=label, view_start=view_start)
+            except Exception as view_err:
+                # keep whatever this view already yielded: super overs are the LAST views, so
+                # one uncaught error earlier in the loop used to lose them without a trace
+                print(f"[-] View '{label}' errored: {view_err} - keeping its partial data")
+            tag_view(view_start, len(all_captured_balls), label)
+
+        browser.close()
+except KeyboardInterrupt:
+    print("\n⚠ Interrupted by user - keeping the deliveries captured so far...")
+except Exception as run_err:
+    print(f"\n⚠ Browser phase ended early: {run_err}")
+    print("   Salvaging the deliveries captured so far instead of losing the whole run...")
+    import traceback; traceback.print_exc()
 
 # ==== DATAFRAME ASSEMBLY ====
 def _is_missing(v):
@@ -630,7 +705,10 @@ def build_dataframe(balls, players, metadata, csv_path):
     # Coalesce duplicates instead of dropping them: the same super-over ball is often
     # seen twice (once half-filled by the page load, once complete from the feed).
     if "id" in df.columns and df["id"].notna().all():
-        keys = df["id"].astype(str)
+        # never de-duplicate on `id` alone: the tie-breaker feed restarts its counter, so a
+        # super-over ball can carry the same id as a regular delivery and be merged away
+        # silently (this is how super overs vanished with no error at all).
+        keys = df["inningNumber"].astype(str) + "|" + df["id"].astype(str)
     else:
         keys = df["inningNumber"].astype(str) + "|" + df["oversActual"].astype(str) + "|" + df.get("title", pd.Series([""] * len(df))).astype(str)
     ordered = list(zip(keys.tolist(), range(len(df))))
@@ -686,6 +764,7 @@ for i, match_url in enumerate(match_urls, start=1):
     print("=" * 80 + "\n")
 
     try:
+        match_url = normalise_url(match_url)
         match_id = extract_match_id(match_url)
         output_csv = f"{match_id}.csv"
 
@@ -745,10 +824,12 @@ for i, match_url in enumerate(match_urls, start=1):
                 print(df_match[df_match["isSuperOver"]][so_cols].head(8).to_string(index=False))
             print("-" * 40)
         else:
-            print(f"[-] Subprocess closed, but '{output_csv}' was not generated.")
+            print(f"[-] Subprocess closed (exit code {process.returncode}), but '{output_csv}' was not generated.")
+            print("    Scroll up: the worker now prints why it stopped instead of dying quietly.")
 
     except Exception as match_err:
-        print(f"❌ Failed to process Match {i} due to error: {match_err}")
+        print(f"❌ Failed to process Match {i} due to error: {type(match_err).__name__}: {match_err}")
+        import traceback; traceback.print_exc()
         continue
 
 print("\n" + "=" * 80)
