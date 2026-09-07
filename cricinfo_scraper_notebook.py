@@ -32,7 +32,9 @@ import asyncio
 import json
 import os
 import re
+import sys
 import threading
+import traceback
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -51,6 +53,8 @@ API_ONLY: bool = False     # True = never touch the innings dropdown (fastest)
 SCROLL_IF_INCOMPLETE: bool = True   # crawl the dropdown for any innings with no balls
 AUTO_RUN: bool = True      # run the queue in MATCH_URLS when this file/cell is executed
 VERBOSE: bool = True
+DEBUG: bool = False        # True = re-raise with a full traceback instead of "[x] failed: ..."
+USE_WORKER_THREAD: str = "auto"   # "auto" | "never" | "always" (see _run_off_loop)
 
 # =============================================================================
 # 2. CONSTANTS
@@ -104,6 +108,60 @@ OVERLAY_JS = """() => {
 
 def _log(msg: str = "") -> None:
     print(msg, flush=True)
+
+
+def describe_exc(exc: BaseException) -> str:
+    """
+    Many exceptions stringify to nothing (CancelledError from an interrupted cell,
+    a bare TimeoutError, NotImplementedError off the main thread...), which is how
+    "[x] failed:" with no reason at all happens. Always name the type.
+    """
+    text = str(exc).strip()
+    name = type(exc).__name__
+    if isinstance(exc, asyncio.CancelledError) or (not text and isinstance(exc, (KeyboardInterrupt, SystemExit))):
+        return (f"{name}: the kernel/cell was interrupted mid-run. Playwright keeps running "
+                "in its own thread, so re-run the cell (and prefer DEBUG=True while setting up)")
+    if not text:
+        hints = {
+            "NotImplementedError": " usually means an asyncio call that only works on the main "
+                                   "thread -- try USE_WORKER_THREAD = 'never'",
+            "TimeoutError": " usually means Chromium stalled on first launch; check that "
+                            "`playwright install chromium` completed",
+            "PermissionError": " usually means the browser binary or OUTPUT_DIR is not writable",
+        }
+        return f"{name}: <no message>{hints.get(name, '')}"
+    return f"{name}: {text}"
+
+
+def _browser_missing_hint() -> str:
+    pip_cmd, install_cmd = _install_commands()
+    return f"Chromium looks unavailable for Playwright. Run:  {pip_cmd}   then   {install_cmd}"
+
+
+def _launch_chromium(p: Any, headless: bool) -> Any:
+    """
+    Launch with the configured flags, then fall back to a plain headless launch.
+
+    `--start-minimized` and headed mode both fail on display-less hosts (Colab,
+    Jupyter on a server, CI), and a failed launch used to surface as an empty error.
+    """
+    base = ["--disable-blink-features=AutomationControlled"]
+    attempts = [(bool(headless), base + (["--start-minimized"] if sys.platform.startswith("win") and not headless else []))]
+    if headless:
+        attempts.append((False, base))
+    else:
+        attempts.append((True, base))
+        attempts.append((True, []))          # last resort: no custom flags at all
+    last: Optional[BaseException] = None
+    for attempt, (hl, args) in enumerate(attempts, start=1):
+        try:
+            if attempt > 1:
+                _log(f"[!] launch attempt {attempt}: headless={hl}, args={args or '[]'}")
+            return p.chromium.launch(headless=hl, args=args)
+        except Exception as exc:  # noqa: BLE001
+            last = exc
+    message = describe_exc(last) if last else "unknown launch failure"
+    raise RuntimeError(f"Could not start Chromium ({message})\n{_browser_missing_hint()}") from last
 
 
 # =============================================================================
@@ -948,11 +1006,10 @@ def _scrape_match_impl(match_url: str, output_csv: Optional[str], headless: bool
             if val and not metadata.get(key):
                 metadata[key] = val
 
+    _log(f"[+] starting Chromium ({'headless' if headless else 'headed'}) -- the very first "
+          "run after `playwright install` can take ~30s")
     with sync_playwright() as p:
-        args = ["--disable-blink-features=AutomationControlled"]
-        if not headless:
-            args.append("--start-minimized")
-        browser = p.chromium.launch(headless=headless, args=args)
+        browser = _launch_chromium(p, headless)
         try:
             context = browser.new_context(user_agent=BROWSER_UA, viewport={"width": 1366, "height": 900})
             page = context.new_page()
@@ -1073,15 +1130,51 @@ def _scrape_match_impl(match_url: str, output_csv: Optional[str], headless: bool
     return df
 
 
-def _run_off_loop(fn):
-    """Playwright's sync API refuses to start while an asyncio loop is running in this
-    thread -- which happens in some Jupyter/Colab kernels. A fresh thread has none."""
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        return fn()          # plain Python / default notebook cell: run inline
+_LOOP_ERROR_HINTS = ("asyncio loop", "sync api inside", "event loop", "another loop")
+
+
+def _loop_conflict(exc: BaseException) -> bool:
+    text = f"{type(exc).__name__} {exc}".lower()
+    return any(hint in text for hint in _LOOP_ERROR_HINTS)
+
+
+def _in_worker_thread(fn):
     with ThreadPoolExecutor(max_workers=1, thread_name_prefix="playwright") as pool:
         return pool.submit(fn).result()
+
+
+def _run_off_loop(fn):
+    """
+    Playwright's sync API refuses to start while an asyncio loop is running in the current
+    thread, which some Jupyter/Colab kernels do.
+
+    Rather than always hopping threads (which itself can fail: `asyncio` primitives and
+    signal handlers are main-thread-only on Windows), run inline first and hop *only* if
+    the failure says the event loop is the problem. Set USE_WORKER_THREAD to "always" or
+    "never" to override.
+    """
+    policy = (USE_WORKER_THREAD or "auto").lower()
+    if policy == "always":
+        return _in_worker_thread(fn)
+
+    loop_running = False
+    try:
+        asyncio.get_running_loop()
+        loop_running = True
+    except RuntimeError:
+        pass
+
+    if policy == "never":
+        return fn()
+    if loop_running:
+        return _in_worker_thread(fn)
+    try:
+        return fn()
+    except BaseException as exc:  # noqa: BLE001 - re-raised below if it is not loop-related
+        if not _loop_conflict(exc):
+            raise
+        _log("[!] the kernel has an asyncio loop running; retrying on a worker thread")
+        return _in_worker_thread(fn)
 
 
 def scrape_match(match_url: str, output_dir: Optional[str] = None, headless: Optional[bool] = None,
@@ -1105,18 +1198,31 @@ def scrape_match(match_url: str, output_dir: Optional[str] = None, headless: Opt
                               crawl_if_incomplete, verbose)
 
 
-def scrape_many(match_urls: Sequence[str], **kwargs):
-    """Scrape a queue of matches and return one concatenated DataFrame (+ `df.attrs['per_match']`)."""
+def scrape_many(match_urls: Sequence[str], strict: Optional[bool] = None, **kwargs):
+    """
+    Scrape a queue of matches and return one concatenated DataFrame.
+
+    `df.attrs['per_match']` maps url -> that match's frame (or None), and
+    `df.attrs['errors']` maps url -> (message, traceback) for the failures, so a
+    half-succeeded batch can be triaged without re-running anything.
+    """
     import pandas as pd
 
-    frames, per_match = [], {}
+    strict = DEBUG if strict is None else strict
+    frames, per_match, errors = [], {}, {}
     for i, url in enumerate(match_urls, start=1):
         _log(f"\n{'=' * 78}\nMATCH {i}/{len(match_urls)}  {url}\n{'=' * 78}")
         try:
             df = scrape_match(url, **kwargs)
-        except Exception as exc:  # noqa: BLE001 - keep the queue going
-            _log(f"[x] failed: {exc}")
+        except BaseException as exc:  # noqa: BLE001 - report properly, then decide
+            tb = traceback.format_exc()
+            errors[url] = (describe_exc(exc), tb)
             per_match[url] = None
+            _log(f"[x] failed: {describe_exc(exc)}")
+            _log("    full traceback below (set DEBUG=True to raise instead of continuing)")
+            print(tb, file=sys.stderr, flush=True)
+            if strict:
+                raise
             continue
         if len(df):
             frames.append(df)
@@ -1126,6 +1232,13 @@ def scrape_many(match_urls: Sequence[str], **kwargs):
             per_match[url] = None
     combined = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
     combined.attrs["per_match"] = per_match
+    combined.attrs["errors"] = errors
+    if errors:
+        _log(f"\n[x] {len(errors)} of {len(match_urls)} match(es) failed:")
+        for url, (msg, _tb) in errors.items():
+            _log(f"      {url}\n          {msg}")
+    else:
+        _log(f"[SUCCESS] {len(match_urls)} match(es), {len(combined)} deliveries")
     return combined
 
 
