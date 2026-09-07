@@ -62,6 +62,7 @@ output_csv = sys.argv[2]
 
 all_captured_balls = []
 player_map = {}  # player_id -> details dict
+expected_super_overs = []   # filled from the scorecard payload; used to police the CSV
 match_metadata = {
     "tournamentName": None,
     "matchName": None,
@@ -75,7 +76,12 @@ DROPDOWN_SELECTOR = "button:has(i.icon-caret_down), button:has(span.ds-text-butt
 # the button's own text looks like an innings label ("1st Innings", "Super Over 1", ...).
 INNINGS_LABEL_RE = re.compile(r'innings|super[\s\-]?over|\bs[\s\-]?over\b|super[\s\-]?5|\bso\b', re.IGNORECASE)
 OPTIONS_SELECTOR = ("div[data-floating-ui-portal] div.ds-cursor-pointer, div.ds-popper div.ds-cursor-pointer, "
-                    "[role='option'], li")
+                    "[role='option'], [role='menuitem'], [role='tab'], li")
+# "1st Innings" / "2nd Innings" / "Super Over 1" / "Innings 3". Used to tell a real innings
+# control apart from the generic ds-text-button-3 buttons sprinkled over the page.
+INNINGS_VIEW_RE = re.compile(r'^(?:\d+\s*(?:st|nd|rd|th)?\s*innings|innings\s*\d+|super[\s\-]*over(?:\s*\d+)?|super[\s\-]*5(?:\s*\d+)?|\bs(?:\s|\-)?over(?:\s*\d+)?(?:\s*\d+)?\b)', re.IGNORECASE)
+DEBUG_CONTROLS = True   # dump the innings-selector markup when the views look incomplete
+active_select = None    # set when the innings picker turns out to be a plain <select>
 
 def normalise_url(url):
     url = str(url).strip()
@@ -381,12 +387,81 @@ def collect_innings_options(page):
             labelled.append((el, name))
     return labelled or everything
 
+def list_select_views(page):
+    """
+    Some Cricinfo templates render the innings picker as a plain <select>. That is strictly
+    easier to drive (no popup to open, select_option() switches), so it is checked first.
+    Returns (handle, [(position, label)]) or (None, []).
+    """
+    try:
+        selects = page.locator("select").all()
+    except Exception:
+        return None, []
+    best_handle, best_views = None, []
+    for sel in selects:
+        try:
+            raw_labels = sel.locator("option").all_inner_texts()
+        except Exception:
+            continue
+        # keep the REAL option index, so index= can address two identically labelled
+        # options ("Super Over 1" for each side) independently
+        views = [(idx, str(text).strip()) for idx, text in enumerate(raw_labels)
+                 if str(text).strip() and INNINGS_LABEL_RE.search(str(text))]
+        if len(views) > len(best_views):
+            best_handle, best_views = sel, views
+    return best_handle, best_views
+
+def dump_innings_controls(page, why):
+    """
+    When the views we found do not match what the scorecard says exists, guess-no-more:
+    dump every innings-looking element (tag, class, text, visibility) so the log tells us
+    exactly what the selector had to work with.
+    """
+    path = f"{MATCH_ID}_innings_controls.txt"
+    try:
+        info = safe_evaluate(page, r"""() => {
+            const out = [];
+            const sel = 'button, select, option, [role="tab"], [role="option"], [role="menuitem"], li, span, a';
+            for (const el of document.querySelectorAll(sel)) {
+                const txt = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+                if (!txt || txt.length > 120) continue;
+                if (!/innings|super\s*over|\bso\b/i.test(txt)) continue;
+                const r = el.getBoundingClientRect();
+                out.push([el.tagName, (el.className || '').toString().slice(0, 90),
+                          el.getAttribute('aria-label') || '', el.getAttribute('value') || '',
+                          Math.round(r.width) + 'x' + Math.round(r.height), txt].join(' | '));
+            }
+            const portal = document.querySelector('div[data-floating-ui-portal], div.ds-popper');
+            const portalHtml = portal ? portal.outerHTML.slice(0, 6000) : '(no open popup found)';
+            return { rows: out.slice(0, 250), portalHtml };
+        }""")
+    except Exception as exc:
+        print(f"  -> could not inspect the innings controls: {type(exc).__name__}: {exc}")
+        return None
+    if not info:
+        return None
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(f"# why: {why}\n\n== innings-looking elements (tag | class | aria-label | value | size | text) ==\n")
+            fh.write("\n".join(info.get("rows", [])) or "(none)")
+            fh.write("\n\n== popup container outerHTML (first 6000 chars) ==\n")
+            fh.write(str(info.get("portalHtml", "")) + "\n")
+        print(f"⚠️  Wrote {path} - the exact markup the innings selector had to work with.")
+        print("    Paste the '== innings-looking elements ==' block and the scraper can be aimed at it.")
+    except Exception as exc:
+        print(f"  -> could not write {path}: {type(exc).__name__}: {exc}")
+    return info
+
 def list_innings_options(page):
     """[(position, label)] for every view in the dropdown, including super overs."""
     options = open_dropdown(page)
     if not options:
         return []
-    entries = [(position, name) for position, (_, name) in enumerate(options)]
+    entries = [(position, name) for position, (_, name) in enumerate(options)
+               if INNINGS_VIEW_RE.match(name)]
+    if not entries:
+        # nothing looked like an innings - fall back to every row rather than scrape nothing
+        entries = [(position, name) for position, (_, name) in enumerate(options)]
 
     try:
         page.mouse.click(10, 10)   # close the popup again
@@ -397,6 +472,17 @@ def list_innings_options(page):
 
 def switch_to_innings_option(page, position, expected_label):
     """Select the view at a given dropdown POSITION (not label)."""
+    if active_select is not None:
+        try:
+            # index, not label: duplicate labels would both resolve to the first option
+            active_select.select_option(index=position)
+            page.wait_for_timeout(2500)
+            print(f"\n[+] Selecting innings view {position}: '{expected_label}' from <select>...")
+            return True
+        except Exception as e:
+            print(f"  ⚠ select_option(index={position}) failed: {type(e).__name__}: {e}")
+            return False
+
     options = open_dropdown(page)
     if not options or position >= len(options):
         return False
@@ -431,13 +517,25 @@ def scroll_active_feed(page, label, view_start, max_scrolls=140):
     for s_idx in range(1, max_scrolls + 1):
         remove_ad_and_cookie_overlays(page)
 
+        # the commentary list is its own overflow panel on current Cricinfo templates, so
+        # scrolling only the window never triggers the next page of balls
         safe_evaluate(page, """() => {
             window.scrollTo(0, document.body.scrollHeight);
-            setTimeout(() => window.scrollBy(0, -400), 100);
-            setTimeout(() => window.scrollTo(0, document.body.scrollHeight), 250);
+            const scrollers = [...document.querySelectorAll('div, section, ul, main')]
+                .filter(el => el.scrollHeight - el.clientHeight > 120 && el.clientHeight > 150);
+            scrollers.sort((a, b) => (b.scrollHeight - b.clientHeight) - (a.scrollHeight - a.clientHeight));
+            for (const el of scrollers.slice(0, 4)) { el.scrollTop = el.scrollHeight; }
+            const feed = document.querySelector('[data-test="wbb-commentary"], [class*="commentary" i], [class*="ball-by-ball" i]');
+            if (feed) feed.scrollIntoView({ block: 'end' });
+            setTimeout(() => window.scrollBy(0, -300), 80);
+            setTimeout(() => window.scrollTo(0, document.body.scrollHeight), 200);
         }""")
         page.keyboard.press("PageDown")
         page.wait_for_timeout(950)
+
+        if s_idx == 3 and len(all_captured_balls) == last_count:
+            print("  -> note: 3 scrolls, no new deliveries. Either this view is genuinely empty,")
+            print("     the feed lives in a panel we cannot scroll, or switching innings did not take effect.")
 
         current_count = len(all_captured_balls)
 
@@ -556,7 +654,6 @@ try:
         # 2. Extract Squad Profiles & Exact Match Info from Scorecard page
         scorecard_url = match_url.replace("ball-by-ball-commentary", "full-scorecard")
         print(f"[+] Fetching scorecard squad & venue metadata from: {scorecard_url}")
-        expected_super_overs = []
         try:
             sc_page = context.new_page()
             sc_page.goto(scorecard_url, wait_until="domcontentloaded", timeout=30000)
@@ -625,25 +722,46 @@ try:
             print(f"[+] Scorecard reports {len(expected_super_overs)} super-over innings: {expected_super_overs}")
         print("=" * 60)
 
-        # 3. Walk EVERY view in the innings dropdown. Positions, not labels: a tied match
-        #    lists "Super Over" / "1st Super Over" entries, sometimes twice with the same
-        #    label (once per side), which label-matching silently skips.
+        # 3. Walk EVERY view in the innings picker. Positions, not labels: a tied match can
+        #    list the tie-breaker twice (once per side) under identical text, and
+        #    label-matching silently skips the second one.
+        select_handle, select_views = list_select_views(page)
         dropdown_views = list_innings_options(page)
-        current_label = get_current_button_text(page)
-        if dropdown_views and dropdown_views[0][0] == 0:
-            # position 0 is whatever is already on screen; prefer the live button label
-            label0 = current_label if current_label not in ("", "Default Innings") else dropdown_views[0][1]
-            all_innings_views = [(0, label0)] + dropdown_views[1:]
-        else:
-            all_innings_views = [(0, current_label)] + list(dropdown_views)
 
-        print(f"[+] Innings views found: {[lab for _, lab in all_innings_views]}")
+        if select_handle is not None and len(select_views) >= max(2, len(dropdown_views)):
+            active_select = select_handle
+            picked_views = list(select_views)
+            print(f"[+] Innings picker is a <select> with {len(picked_views)} views.")
+        else:
+            current_label = get_current_button_text(page)
+            picked_views = list(dropdown_views)
+            if picked_views and picked_views[0][0] == 0:
+                # position 0 is whatever is already on screen; prefer the live button label
+                label0 = current_label if current_label not in ("", "Default Innings") else picked_views[0][1]
+                picked_views = [(0, label0)] + picked_views[1:]
+            else:
+                picked_views = [(0, current_label)] + picked_views
+
+        # The scorecard knows how many innings exist, so a short view list is a bug in this
+        # scraper, not a fact about the match - say so instead of quietly writing less data.
+        expected_views = 2 + len(expected_super_overs)
+        all_innings_views = picked_views
+        print(f"[+] Innings views found ({len(all_innings_views)}): {[lab for _, lab in all_innings_views]}")
         if expected_super_overs and not any(is_super_over_label(lab) for _, lab in all_innings_views):
-            print("⚠️  Scorecard has a super over but NO dropdown view was labelled as one -")
-            print("   the tie-breaker may be missing from this CSV. Check the innings selector manually.")
+            print(f"⚠️  Scorecard reports {len(expected_super_overs)} super-over innings "
+                  f"{expected_super_overs} but the innings picker offered no matching view:")
+            print(f"   views were {[lab for _, lab in all_innings_views]}. The CSV will be missing them.")
+        if len(all_innings_views) < expected_views or (expected_super_overs and not any(
+                is_super_over_label(lab) for _, lab in all_innings_views)):
+            print(f"  -> expected at least {expected_views} views (2 innings + "
+                  f"{len(expected_super_overs)} super-over innings); found {len(all_innings_views)}")
+            if DEBUG_CONTROLS:
+                dump_innings_controls(page, f"found {len(all_innings_views)} views, expected >= {expected_views}")
 
         for step, (position, label) in enumerate(all_innings_views, start=1):
-            view_start = len(all_captured_balls)
+            # everything captured before STEP 1 belongs to the view that was already on screen
+            # (the page-load payload), otherwise those balls end up attributed to no innings
+            view_start = 0 if step == 1 else len(all_captured_balls)
             print("=" * 60)
             try:
                 if step == 1:
@@ -740,10 +858,12 @@ def build_dataframe(balls, players, metadata, csv_path):
     # Coalesce duplicates instead of dropping them: the same super-over ball is often
     # seen twice (once half-filled by the page load, once complete from the feed).
     if "id" in df.columns and df["id"].notna().all():
-        # never de-duplicate on `id` alone: the tie-breaker feed restarts its counter, so a
-        # super-over ball can carry the same id as a regular delivery and be merged away
-        # silently (this is how super overs vanished with no error at all).
-        keys = df["inningNumber"].astype(str) + "|" + df["id"].astype(str)
+        # Never de-duplicate on `id` alone, and never on (inningNumber, id) either: Cricinfo
+        # numbers the tie-breakers "1" and "2" as well (the scorecard line
+        # "2 super-over innings: [(1, 'Super Over'), (2, 'Super Over')]" is literally that),
+        # so a super-over ball shares its key with a regular delivery and gets merged away
+        # without a word. isSuperOver is what keeps the two innings apart.
+        keys = (df["inningNumber"].astype(str) + "|" + df["id"].astype(str) + "|" + df["isSuperOver"].astype(str))
     else:
         keys = df["inningNumber"].astype(str) + "|" + df["oversActual"].astype(str) + "|" + df.get("title", pd.Series([""] * len(df))).astype(str)
     ordered = list(zip(keys.tolist(), range(len(df))))
@@ -759,6 +879,19 @@ def build_dataframe(balls, players, metadata, csv_path):
             if _is_missing(records[target].get(field)) and not _is_missing(value):
                 records[target][field] = value
     df = pd.DataFrame([records[i] for i in keep_idx])
+    if "id" in df.columns:
+        loose = df["inningNumber"].astype(str) + "|" + df["id"].astype(str)
+        dupes = loose.duplicated(keep=False)
+        # A tied match legitimately holds a regular AND a super-over row on the same
+        # (inningNumber, id), so only the unfinished leftovers are worth flagging.
+        if "commentaryText" in df.columns:
+            txt = df["commentaryText"].astype(str).str.strip()
+            thin = dupes & (df["commentaryText"].isna() | txt.isin(["", "None", "nan"]))
+        else:
+            thin = dupes & pd.Series(False, index=df.index)
+        if int(thin.sum()):
+            print(f"⚠️  {int(thin.sum())} repeated deliveries are half-filled (no commentary text): "
+                  f"the feed saw them twice but never completed them.")
 
     # Sort on real numbers: 'oversActual' is a string, so 10.1 sorted before 2.5.
     parts = df["oversActual"].map(over_parts) if "oversActual" in df.columns else pd.Series([(0, 0)] * len(df))
@@ -775,7 +908,18 @@ if all_captured_balls:
     super_rows = int(df["isSuperOver"].sum()) if "isSuperOver" in df.columns else 0
     print("=" * 60)
     print(f"✅ Extracted {len(df)} total deliveries across ALL innings!")
-    print(f"✅ {super_rows} of them are SUPER OVER deliveries" if super_rows else "ℹ️  No super over in this match (or no super-over view was found)")
+    if super_rows:
+        print(f"✅ {super_rows} of them are SUPER OVER deliveries")
+    elif expected_super_overs:
+        print(f"⚠️  INCOMPLETE: the scorecard reports {len(expected_super_overs)} super-over innings "
+              f"{expected_super_overs} but 0 rows are flagged isSuperOver.")
+        print("   The innings picker never delivered the tie-breaker view(s) above, so do NOT model on this CSV yet.")
+    else:
+        print("ℹ️  No super over in this match (scorecard agrees)")
+    if "inningLabel" in df.columns:
+        unattributed = int(df["inningLabel"].isna().sum() + (df["inningLabel"].astype(str).isin(["", "None", "nan"])).sum())
+        if unattributed:
+            print(f"ℹ️  {unattributed} rows carry no innings label - they came from the page load, not a dropdown view")
     print(f"✅ Saved full dataset to '{output_csv}'")
     print("=" * 60)
 else:
@@ -835,6 +979,9 @@ for i, match_url in enumerate(match_urls, start=1):
             print(f"[SUCCESS] Loaded {len(df_match)} total deliveries from '{output_csv}'\n")
 
             print("--- INNINGS BREAKDOWN ---")
+            if "inningLabel" in df_match.columns:
+                for lab, cnt in df_match.groupby(df_match["inningLabel"].fillna("(unlabelled)")).size().items():
+                    print(f"  view '{lab}': {cnt} rows")
             if "inningNumber" in df_match.columns:
                 counts = df_match["inningNumber"].value_counts().sort_index()
                 for inn, count in counts.items():
@@ -850,7 +997,7 @@ for i, match_url in enumerate(match_urls, start=1):
             ] if c in df_match.columns]
 
             print("\n--- SAMPLE ENRICHED DATA ---")
-            print(df_match[sample_cols].dropna().head(3).to_string(index=False))
+            print(df_match[sample_cols].dropna(how="all").head(3).to_string(index=False))
 
             if "isSuperOver" in df_match.columns and df_match["isSuperOver"].any():
                 print("\n--- SUPER OVER SAMPLE ---")
