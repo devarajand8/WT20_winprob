@@ -39,4 +39,27 @@ The win-probability model here is trained on full 20-over innings, so filter on
 it -- a 6-ball innings with a 100% win probability at ball 6 would otherwise distort
 match-level state estimation.
 
+### Jupyter / Colab version
+
+`cricinfo_scraper_notebook.py` is the same scraper as a single paste-and-run cell: no
+subprocess, no CLI flags, it returns `pandas.DataFrame`s and (unlike the script) writes no
+files unless you set `OUTPUT_DIR`.
+
+```python
+%pip install -q playwright pandas
+!playwright install --with-deps chromium     # Colab/Linux
+
+import cricinfo_scraper_notebook as cric     # or paste the whole file into one cell
+
+df = cric.scrape_match("https://www.espncricinfo.com/series/.../ball-by-ball-commentary")
+df[df.isSuperOver]                            # just the tie-breaker deliveries
+
+all_matches = cric.scrape_many(["url1", "url2", "url3"])   # one concatenated frame
+```
+
+Edit `MATCH_URLS` / `OUTPUT_DIR` / `HEADLESS` at the top of the file and run it as-is to get
+`combined_df` in the notebook namespace. `scrape_match` hops onto a worker thread when the
+kernel already has a running asyncio loop, which is what otherwise makes Playwright's sync
+API refuse to start inside Jupyter.
+
 Tests (no network, no browser): `python -m unittest discover -s tests`
