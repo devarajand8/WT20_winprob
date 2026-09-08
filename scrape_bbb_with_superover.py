@@ -59,13 +59,23 @@ match_metadata = {
 # TEAM / BATTING-BOWLING TRACKING
 # -----------------------------------------------------------------------
 # team_registry maps a team's objectId (as a string) -> {"name", "abbreviation"}.
-# match_team_ids holds the two objectIds of the teams actually playing this
-# match (order not significant -- just used to figure out "the other team").
+# match_team_ids holds the objectIds of every team seen batting in THIS
+# match (should end up with exactly two -- order not significant, just
+# used to figure out "the other team" for the bowling side).
 # innings_team_map maps inningNumber -> the objectId of the team that BATTED
 # in that innings (this naturally covers Super Over innings too, since
 # ESPNcricinfo keeps incrementing inningNumber for them, e.g. 3, 4, ...).
+#
+# IMPORTANT: these are populated ONLY from each ball's own "over.team"
+# field (the same trusted, ball-scoped field already used to determine
+# isSuperOver). Earlier this session we tried a generic scan of any
+# "teams"/"innings" list found anywhere in a network response, but that
+# picked up unrelated team pairings from other widgets on the page (e.g.
+# a "Pamir Legends" team that has nothing to do with this match),
+# corrupting bowlingTeamName. Deriving strictly from over.team on this
+# match's own balls avoids that entirely.
 team_registry = {}
-match_team_ids = []
+match_team_ids = set()
 innings_team_map = {}
 
 def register_team(team_obj):
@@ -90,49 +100,31 @@ def register_team(team_obj):
         team_registry[tid]["abbreviation"] = str(abbr).strip()
     return tid
 
-def extract_teams_and_innings_map(obj):
-    # Walks any JSON blob (network responses / __NEXT_DATA__) looking for:
-    #   1. The match's two-team roster, e.g. match.teams == [{"team": {...},
-    #      "isHome": bool}, {"team": {...}, "isHome": bool}]
-    #   2. Per-innings batting team info, e.g. content.innings == [{"team":
-    #      {...}, "inningNumber": 1, ...}, ...] -- this also naturally
-    #      includes Super Over innings (inningNumber 3, 4, ...).
-    if isinstance(obj, dict):
-        if "teams" in obj and isinstance(obj["teams"], list) and len(obj["teams"]) >= 2:
-            candidate_ids = []
-            for t in obj["teams"]:
-                team_obj = t.get("team") if isinstance(t, dict) else None
-                if isinstance(team_obj, dict):
-                    tid = register_team(team_obj)
-                    if tid:
-                        candidate_ids.append(tid)
-            if len(candidate_ids) >= 2 and not match_team_ids:
-                match_team_ids.extend(candidate_ids[:2])
-
-        if "innings" in obj and isinstance(obj["innings"], list):
-            for inn in obj["innings"]:
-                if isinstance(inn, dict):
-                    inn_num = inn.get("inningNumber")
-                    team_obj = inn.get("team")
-                    if isinstance(team_obj, dict) and inn_num is not None:
-                        tid = register_team(team_obj)
-                        if tid:
-                            try:
-                                innings_team_map[int(inn_num)] = tid
-                            except (TypeError, ValueError):
-                                pass
-
-        for k, v in obj.items():
-            extract_teams_and_innings_map(v)
-    elif isinstance(obj, list):
-        for item in obj:
-            extract_teams_and_innings_map(item)
+def register_innings_team_from_ball(c_flat):
+    # Every ball that ends an over carries a nested "over" object with the
+    # batting team for that specific inningNumber. We use ONLY this
+    # ball-scoped data (never a generic site-wide JSON scan) so we can't
+    # accidentally pick up an unrelated team from some other widget.
+    over_obj = c_flat.get("over")
+    if not isinstance(over_obj, dict):
+        return
+    inn_num = over_obj.get("inningNumber", c_flat.get("inningNumber"))
+    team_obj = over_obj.get("team")
+    if isinstance(team_obj, dict) and inn_num is not None:
+        tid = register_team(team_obj)
+        if tid:
+            try:
+                innings_team_map[int(inn_num)] = tid
+                match_team_ids.add(tid)
+            except (TypeError, ValueError):
+                pass
 
 def resolve_team_names_for_inning(inning_num):
     # Given an inningNumber, returns (battingTeamName, bowlingTeamName),
-    # using whatever team/innings metadata was discovered anywhere in the
-    # captured JSON. Falls back to (None, None) if we never saw a mapping
-    # for that particular innings (e.g. a response was missed).
+    # using only the team/innings metadata collected from this match's own
+    # balls (see register_innings_team_from_ball). Falls back to (None,
+    # None) if we never saw an over.team for that particular innings (e.g.
+    # every over-ending-ball response for it was missed).
     try:
         inning_num_int = int(inning_num)
     except (TypeError, ValueError):
@@ -280,6 +272,7 @@ def parse_comments(obj):
                 if isinstance(c, dict) and ("id" in c or "oversActual" in c):
                     c_flat = flatten_ball(c)
                     tag_super_over_fields(c_flat, from_super_over_container=False)
+                    register_innings_team_from_ball(c_flat)
                     extracted.append(c_flat)
         # Super Over deliveries are also exposed via their own dedicated
         # "superOverBallComments" array in the __NEXT_DATA__ payload.
@@ -288,6 +281,7 @@ def parse_comments(obj):
                 if isinstance(c, dict) and ("id" in c or "oversActual" in c):
                     c_flat = flatten_ball(c)
                     tag_super_over_fields(c_flat, from_super_over_container=True)
+                    register_innings_team_from_ball(c_flat)
                     extracted.append(c_flat)
         for k, v in obj.items():
             extracted.extend(parse_comments(v))
@@ -528,7 +522,6 @@ with sync_playwright() as p:
                     all_captured_balls.extend(balls)
                 find_players_anywhere(res_json)
                 extract_direct_match_header_json(res_json)
-                extract_teams_and_innings_map(res_json)
             except Exception:
                 pass
 
@@ -558,7 +551,6 @@ with sync_playwright() as p:
             all_captured_balls.extend(parse_comments(next_json))
             find_players_anywhere(next_json)
             extract_direct_match_header_json(next_json)
-            extract_teams_and_innings_map(next_json)
     except Exception:
         pass
 
@@ -603,7 +595,6 @@ with sync_playwright() as p:
             sc_json = json.loads(sc_json_str)
             find_players_anywhere(sc_json)
             extract_direct_match_header_json(sc_json)
-            extract_teams_and_innings_map(sc_json)
 
         sc_dom_meta = safe_evaluate(sc_page, r"""() => {
             let venue = "";
