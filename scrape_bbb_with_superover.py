@@ -150,9 +150,17 @@ def tag_super_over_fields(c_flat, from_super_over_container):
             super_over_number = None
     c_flat["superOverNumber"] = super_over_number
 
-    # Keep the browser-side dropdown label too, purely as extra descriptive
-    # metadata (handy for debugging) -- it is NOT used to decide isSuperOver.
-    c_flat["inningsLabel"] = CURRENT_LABEL.get("value")
+    # Descriptive label for humans reading the CSV. Derived deterministically
+    # from the fields we just computed above (never from the browser's
+    # dropdown state, which is unreliable -- see tag_super_over_fields()).
+    if is_super_over:
+        c_flat["inningsLabel"] = (
+            "Super Over %d" % super_over_number if super_over_number else "Super Over"
+        )
+    elif isinstance(inning_num, (int, float)):
+        c_flat["inningsLabel"] = "Innings %d" % int(inning_num)
+    else:
+        c_flat["inningsLabel"] = CURRENT_LABEL.get("value")
 
 
 def flatten_ball(c):
