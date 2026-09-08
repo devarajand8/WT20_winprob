@@ -56,6 +56,103 @@ match_metadata = {
 }
 
 # -----------------------------------------------------------------------
+# TEAM / BATTING-BOWLING TRACKING
+# -----------------------------------------------------------------------
+# team_registry maps a team's objectId (as a string) -> {"name", "abbreviation"}.
+# match_team_ids holds the two objectIds of the teams actually playing this
+# match (order not significant -- just used to figure out "the other team").
+# innings_team_map maps inningNumber -> the objectId of the team that BATTED
+# in that innings (this naturally covers Super Over innings too, since
+# ESPNcricinfo keeps incrementing inningNumber for them, e.g. 3, 4, ...).
+team_registry = {}
+match_team_ids = []
+innings_team_map = {}
+
+def register_team(team_obj):
+    if not isinstance(team_obj, dict):
+        return None
+    tid = team_obj.get("objectId") or team_obj.get("id") or team_obj.get("teamId")
+    if tid is None:
+        return None
+    tid = str(tid)
+    name = (
+        team_obj.get("longName")
+        or team_obj.get("name")
+        or team_obj.get("shortName")
+        or team_obj.get("abbreviation")
+    )
+    abbr = team_obj.get("abbreviation") or team_obj.get("shortName")
+    if tid not in team_registry:
+        team_registry[tid] = {}
+    if name and not team_registry[tid].get("name"):
+        team_registry[tid]["name"] = str(name).strip()
+    if abbr and not team_registry[tid].get("abbreviation"):
+        team_registry[tid]["abbreviation"] = str(abbr).strip()
+    return tid
+
+def extract_teams_and_innings_map(obj):
+    # Walks any JSON blob (network responses / __NEXT_DATA__) looking for:
+    #   1. The match's two-team roster, e.g. match.teams == [{"team": {...},
+    #      "isHome": bool}, {"team": {...}, "isHome": bool}]
+    #   2. Per-innings batting team info, e.g. content.innings == [{"team":
+    #      {...}, "inningNumber": 1, ...}, ...] -- this also naturally
+    #      includes Super Over innings (inningNumber 3, 4, ...).
+    if isinstance(obj, dict):
+        if "teams" in obj and isinstance(obj["teams"], list) and len(obj["teams"]) >= 2:
+            candidate_ids = []
+            for t in obj["teams"]:
+                team_obj = t.get("team") if isinstance(t, dict) else None
+                if isinstance(team_obj, dict):
+                    tid = register_team(team_obj)
+                    if tid:
+                        candidate_ids.append(tid)
+            if len(candidate_ids) >= 2 and not match_team_ids:
+                match_team_ids.extend(candidate_ids[:2])
+
+        if "innings" in obj and isinstance(obj["innings"], list):
+            for inn in obj["innings"]:
+                if isinstance(inn, dict):
+                    inn_num = inn.get("inningNumber")
+                    team_obj = inn.get("team")
+                    if isinstance(team_obj, dict) and inn_num is not None:
+                        tid = register_team(team_obj)
+                        if tid:
+                            try:
+                                innings_team_map[int(inn_num)] = tid
+                            except (TypeError, ValueError):
+                                pass
+
+        for k, v in obj.items():
+            extract_teams_and_innings_map(v)
+    elif isinstance(obj, list):
+        for item in obj:
+            extract_teams_and_innings_map(item)
+
+def resolve_team_names_for_inning(inning_num):
+    # Given an inningNumber, returns (battingTeamName, bowlingTeamName),
+    # using whatever team/innings metadata was discovered anywhere in the
+    # captured JSON. Falls back to (None, None) if we never saw a mapping
+    # for that particular innings (e.g. a response was missed).
+    try:
+        inning_num_int = int(inning_num)
+    except (TypeError, ValueError):
+        return None, None
+
+    batting_id = innings_team_map.get(inning_num_int)
+    if batting_id is None:
+        return None, None
+
+    bowling_id = None
+    for tid in match_team_ids:
+        if tid != batting_id:
+            bowling_id = tid
+            break
+
+    batting_name = team_registry.get(batting_id, {}).get("name")
+    bowling_name = team_registry.get(bowling_id, {}).get("name") if bowling_id else None
+    return batting_name, bowling_name
+
+# -----------------------------------------------------------------------
 # SUPER OVER TRACKING
 # -----------------------------------------------------------------------
 # Whichever innings/tab is currently selected in the commentary dropdown is
@@ -431,6 +528,7 @@ with sync_playwright() as p:
                     all_captured_balls.extend(balls)
                 find_players_anywhere(res_json)
                 extract_direct_match_header_json(res_json)
+                extract_teams_and_innings_map(res_json)
             except Exception:
                 pass
 
@@ -460,6 +558,7 @@ with sync_playwright() as p:
             all_captured_balls.extend(parse_comments(next_json))
             find_players_anywhere(next_json)
             extract_direct_match_header_json(next_json)
+            extract_teams_and_innings_map(next_json)
     except Exception:
         pass
 
@@ -504,6 +603,7 @@ with sync_playwright() as p:
             sc_json = json.loads(sc_json_str)
             find_players_anywhere(sc_json)
             extract_direct_match_header_json(sc_json)
+            extract_teams_and_innings_map(sc_json)
 
         sc_dom_meta = safe_evaluate(sc_page, r"""() => {
             let venue = "";
@@ -589,6 +689,16 @@ with sync_playwright() as p:
 if all_captured_balls:
     df = pd.DataFrame(all_captured_balls)
     df["inningNumber"] = pd.to_numeric(df.get("inningNumber"), errors="coerce").fillna(0).astype(int)
+
+    # Batting/bowling team names, one lookup per unique inningNumber (covers
+    # Super Over innings too, since ESPNcricinfo keeps incrementing
+    # inningNumber for them -- innings_team_map was populated the same way
+    # regardless of whether the innings was a regular one or a Super Over).
+    team_name_cache = {
+        inn: resolve_team_names_for_inning(inn) for inn in df["inningNumber"].unique()
+    }
+    df["battingTeamName"] = df["inningNumber"].map(lambda inn: team_name_cache.get(inn, (None, None))[0])
+    df["bowlingTeamName"] = df["inningNumber"].map(lambda inn: team_name_cache.get(inn, (None, None))[1])
 
     # Guarantee the Super Over columns exist even if, for some reason, no
     # ball ever went through the tagging branch above (e.g. very old cached
@@ -712,11 +822,18 @@ for i, match_url in enumerate(match_urls, start=1):
                     inn_df = df_match[df_match["inningNumber"] == inn]
                     is_so = bool(inn_df["isSuperOver"].any()) if "isSuperOver" in inn_df.columns else False
                     tag = " (SUPER OVER)" if is_so else ""
-                    print(f"  * Innings {inn}{tag}: {count:4d} deliveries (overs {inn_df['oversActual'].min()} -> {inn_df['oversActual'].max()})")
+                    teams_note = ""
+                    if "battingTeamName" in inn_df.columns and "bowlingTeamName" in inn_df.columns:
+                        bat_team = inn_df["battingTeamName"].dropna().iloc[0] if inn_df["battingTeamName"].notna().any() else None
+                        bowl_team = inn_df["bowlingTeamName"].dropna().iloc[0] if inn_df["bowlingTeamName"].notna().any() else None
+                        if bat_team and bowl_team:
+                            teams_note = f" [{bat_team} batting vs {bowl_team} bowling]"
+                    print(f"  * Innings {inn}{tag}{teams_note}: {count:4d} deliveries (overs {inn_df['oversActual'].min()} -> {inn_df['oversActual'].max()})")
             print("-" * 40)
             
             sample_cols = [c for c in [
                 "tournamentName", "matchName", "venue", "isSuperOver", "superOverNumber", "oversActual",
+                "battingTeamName", "bowlingTeamName",
                 "batsmanName", "batsmanBattingStyle",
                 "bowlerName", "bowlerBowlingStyle", "bowlerBowlingHand"
             ] if c in df_match.columns]
