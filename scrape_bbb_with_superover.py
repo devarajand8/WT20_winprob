@@ -239,8 +239,44 @@ def extract_direct_match_header_json(root_json):
                 elif g_name:
                     match_metadata["venue"] = str(g_name).strip()
 
+def normalize_cricinfo_url(url):
+    # "cricinfo.com" is just a redirector domain -- it client-side-navigates
+    # to "www.espncricinfo.com" a couple seconds after load. If our
+    # page.evaluate() calls race that redirect, Playwright raises
+    # "Execution context was destroyed, most likely because of a
+    # navigation" and kills the whole worker. Rewriting the URL up front
+    # avoids that navigation altogether.
+    return re.sub(r'https?://(www\.)?cricinfo\.com/', 'https://www.espncricinfo.com/', url)
+
+def safe_evaluate(page, script, arg=None, retries=4, wait_ms=800):
+    # Wrapper around page.evaluate() that tolerates a navigation happening
+    # mid-call (e.g. a stray client-side redirect, ad script, or SPA route
+    # change destroying the JS execution context). Instead of the whole
+    # worker crashing, we just wait briefly and retry a few times, and
+    # finally give up gracefully by returning `default`.
+    last_err = None
+    for attempt in range(retries):
+        try:
+            if arg is not None:
+                return page.evaluate(script, arg)
+            return page.evaluate(script)
+        except Exception as e:
+            last_err = e
+            msg = str(e).lower()
+            if "execution context was destroyed" in msg or "navigation" in msg or "target closed" in msg:
+                try:
+                    page.wait_for_load_state("domcontentloaded", timeout=8000)
+                except Exception:
+                    pass
+                page.wait_for_timeout(wait_ms)
+                continue
+            else:
+                break
+    print(f"  [!] safe_evaluate: giving up after {attempt + 1} attempt(s) ({last_err})")
+    return None
+
 def remove_ad_and_cookie_overlays(page):
-    page.evaluate("""() => {
+    safe_evaluate(page, """() => {
         const otBtn = document.getElementById('onetrust-accept-btn-handler');
         if (otBtn) otBtn.click();
         const selectors = [
@@ -263,7 +299,7 @@ def get_current_button_text(page):
 
 def switch_to_next_unvisited_innings(page, visited_names):
     remove_ad_and_cookie_overlays(page)
-    page.evaluate("window.scrollTo(0, 0)")
+    safe_evaluate(page, "window.scrollTo(0, 0)")
     page.wait_for_timeout(500)
     
     dropdown_btn = page.locator("button:has(i.icon-caret_down), button:has(span.ds-text-button-3)").first
@@ -274,7 +310,7 @@ def switch_to_next_unvisited_innings(page, visited_names):
     try:
         dropdown_btn.click(force=True, timeout=4000)
     except Exception:
-        page.evaluate("() => { const b = document.querySelector('button:has(i.icon-caret_down)'); if(b) b.click(); }")
+        safe_evaluate(page, "() => { const b = document.querySelector('button:has(i.icon-caret_down)'); if(b) b.click(); }")
         
     page.wait_for_timeout(1000)
     
@@ -310,7 +346,7 @@ def scroll_active_feed(page, label, max_scrolls=140):
     for s_idx in range(1, max_scrolls + 1):
         remove_ad_and_cookie_overlays(page)
         
-        page.evaluate("""() => {
+        safe_evaluate(page, """() => {
             window.scrollTo(0, document.body.scrollHeight);
             setTimeout(() => window.scrollBy(0, -400), 100);
             setTimeout(() => window.scrollTo(0, document.body.scrollHeight), 250);
@@ -363,13 +399,24 @@ with sync_playwright() as p:
     page.on("response", on_response)
 
     # 1. Load Commentary Page
+    # Normalize away the cricinfo.com -> www.espncricinfo.com redirector so
+    # we land straight on the final URL and don't race a client-side
+    # navigation with our page.evaluate() calls below.
+    match_url = normalize_cricinfo_url(match_url)
     print(f"[+] Loading match commentary: {match_url}")
     page.goto(match_url, wait_until="domcontentloaded", timeout=60000)
     page.wait_for_timeout(3500)
+    # Settle any residual client-side redirects/navigations before we start
+    # calling page.evaluate() so we don't hit "Execution context was
+    # destroyed" errors.
+    try:
+        page.wait_for_load_state("networkidle", timeout=8000)
+    except Exception:
+        pass
     remove_ad_and_cookie_overlays(page)
 
     try:
-        next_json_str = page.evaluate('() => document.getElementById("__NEXT_DATA__") ? document.getElementById("__NEXT_DATA__").textContent : null')
+        next_json_str = safe_evaluate(page, '() => document.getElementById("__NEXT_DATA__") ? document.getElementById("__NEXT_DATA__").textContent : null')
         if next_json_str:
             next_json = json.loads(next_json_str)
             all_captured_balls.extend(parse_comments(next_json))
@@ -378,7 +425,7 @@ with sync_playwright() as p:
     except Exception:
         pass
 
-    dom_meta = page.evaluate(r"""() => {
+    dom_meta = safe_evaluate(page, r"""() => {
         let tournament = "";
         let matchName = "";
         let venue = "";
@@ -393,7 +440,7 @@ with sync_playwright() as p:
         if (gLink) venue = gLink.innerText.trim();
 
         return { tournament, matchName, venue };
-    }""")
+    }""") or {}
     
     if not match_metadata["tournamentName"] and dom_meta.get("tournament"):
         match_metadata["tournamentName"] = dom_meta["tournament"]
@@ -409,14 +456,18 @@ with sync_playwright() as p:
         sc_page = context.new_page()
         sc_page.goto(scorecard_url, wait_until="domcontentloaded", timeout=30000)
         sc_page.wait_for_timeout(2000)
+        try:
+            sc_page.wait_for_load_state("networkidle", timeout=8000)
+        except Exception:
+            pass
         
-        sc_json_str = sc_page.evaluate('() => document.getElementById("__NEXT_DATA__") ? document.getElementById("__NEXT_DATA__").textContent : null')
+        sc_json_str = safe_evaluate(sc_page, '() => document.getElementById("__NEXT_DATA__") ? document.getElementById("__NEXT_DATA__").textContent : null')
         if sc_json_str:
             sc_json = json.loads(sc_json_str)
             find_players_anywhere(sc_json)
             extract_direct_match_header_json(sc_json)
 
-        sc_dom_meta = sc_page.evaluate(r"""() => {
+        sc_dom_meta = safe_evaluate(sc_page, r"""() => {
             let venue = "";
             let tournament = "";
             
@@ -437,7 +488,7 @@ with sync_playwright() as p:
                 if (gLink) venue = gLink.innerText.trim();
             }
             return { venue, tournament };
-        }""")
+        }""") or {}
         
         if sc_dom_meta.get("venue"):
             match_metadata["venue"] = sc_dom_meta["venue"]
