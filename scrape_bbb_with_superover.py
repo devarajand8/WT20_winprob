@@ -115,44 +115,74 @@ def derive_bowling_hand_and_style(style_val, hand_val=None):
             
     return style_clean, hand_clean
 
+def tag_super_over_fields(c_flat, from_super_over_container):
+    # --- Super Over tagging ---
+    # Determine isSuperOver / superOverNumber purely from data that is
+    # intrinsic to the ball itself, never from which dropdown tab happened
+    # to be selected in the browser at capture time (that approach is
+    # fragile: stray/duplicate network responses can arrive while a
+    # different tab is active, silently mislabeling ordinary innings 1/2
+    # deliveries as Super Over balls, or vice versa).
+    #
+    # ESPNcricinfo's __NEXT_DATA__ payload exposes Super Over deliveries
+    # two ways, both of which we check here:
+    #   1. They live in their own top-level "superOverBallComments" array
+    #      (separate from the regular "comments" array).
+    #   2. Each ball's nested "over" object carries its own boolean
+    #      "isSuperOver" flag (e.g. over.isSuperOver == true).
+    # As a last-resort fallback (e.g. if a response is missing the "over"
+    # sub-object), inningNumber > 2 is used, since ESPNcricinfo continues
+    # incrementing inningNumber past 2 for Super Overs (3, 4, 5, ...).
+    over_obj = c_flat.get("over")
+    over_is_super = isinstance(over_obj, dict) and bool(over_obj.get("isSuperOver"))
+
+    inning_num = c_flat.get("inningNumber")
+    inning_num_over_2 = isinstance(inning_num, (int, float)) and inning_num > 2
+
+    is_super_over = bool(from_super_over_container or over_is_super or inning_num_over_2)
+    c_flat["isSuperOver"] = is_super_over
+
+    super_over_number = None
+    if is_super_over and isinstance(inning_num, (int, float)):
+        try:
+            super_over_number = int(inning_num) - 2
+        except (TypeError, ValueError):
+            super_over_number = None
+    c_flat["superOverNumber"] = super_over_number
+
+    # Keep the browser-side dropdown label too, purely as extra descriptive
+    # metadata (handy for debugging) -- it is NOT used to decide isSuperOver.
+    c_flat["inningsLabel"] = CURRENT_LABEL.get("value")
+
+
+def flatten_ball(c):
+    c_flat = dict(c)
+    if "predictions" in c_flat and isinstance(c_flat["predictions"], dict):
+        for k, v in c_flat["predictions"].items():
+            c_flat[k] = v
+    if "dismissalText" in c_flat and isinstance(c_flat["dismissalText"], dict):
+        c_flat["dismissal_text_short"] = c_flat["dismissalText"].get("short")
+        c_flat["dismissal_text_long"] = c_flat["dismissalText"].get("long")
+        c_flat["dismissal_text_commentary"] = c_flat["dismissalText"].get("commentary")
+    return c_flat
+
+
 def parse_comments(obj):
     extracted = []
     if isinstance(obj, dict):
         if "comments" in obj and isinstance(obj["comments"], list):
             for c in obj["comments"]:
                 if isinstance(c, dict) and ("id" in c or "oversActual" in c):
-                    c_flat = dict(c)
-                    if "predictions" in c_flat and isinstance(c_flat["predictions"], dict):
-                        for k, v in c_flat["predictions"].items():
-                            c_flat[k] = v
-                    if "dismissalText" in c_flat and isinstance(c_flat["dismissalText"], dict):
-                        c_flat["dismissal_text_short"] = c_flat["dismissalText"].get("short")
-                        c_flat["dismissal_text_long"] = c_flat["dismissalText"].get("long")
-                        c_flat["dismissal_text_commentary"] = c_flat["dismissalText"].get("commentary")
-
-                    # --- Super Over tagging ---
-                    # Stamp the ball with whatever dropdown/tab label was
-                    # active in the browser at the moment it was captured.
-                    # This lets us reliably tell Super Over deliveries apart
-                    # from normal innings 1/2 deliveries downstream, even
-                    # though ESPNcricinfo just keeps incrementing
-                    # inningNumber (3, 4, ...) for Super Overs under the hood.
-                    label = CURRENT_LABEL.get("value")
-                    c_flat["inningsLabel"] = label
-                    c_flat["isSuperOver"] = bool(
-                        is_super_over_label(label) or
-                        (isinstance(c_flat.get("inningNumber"), (int, float)) and c_flat.get("inningNumber", 0) > 2)
-                    )
-                    so_num = extract_super_over_number_from_label(label)
-                    if so_num is None and c_flat["isSuperOver"]:
-                        # Fall back to deriving Super Over # from inningNumber
-                        # (inningNumber 3 -> Super Over 1, 4 -> Super Over 2, ...)
-                        try:
-                            so_num = int(c_flat.get("inningNumber")) - 2
-                        except (TypeError, ValueError):
-                            so_num = None
-                    c_flat["superOverNumber"] = so_num
-
+                    c_flat = flatten_ball(c)
+                    tag_super_over_fields(c_flat, from_super_over_container=False)
+                    extracted.append(c_flat)
+        # Super Over deliveries are also exposed via their own dedicated
+        # "superOverBallComments" array in the __NEXT_DATA__ payload.
+        if "superOverBallComments" in obj and isinstance(obj["superOverBallComments"], list):
+            for c in obj["superOverBallComments"]:
+                if isinstance(c, dict) and ("id" in c or "oversActual" in c):
+                    c_flat = flatten_ball(c)
+                    tag_super_over_fields(c_flat, from_super_over_container=True)
                     extracted.append(c_flat)
         for k, v in obj.items():
             extracted.extend(parse_comments(v))
